@@ -79,19 +79,19 @@ func TestFakeProviderContract(t *testing.T) {
 					"chat-model": {
 						Content:      "hello from fake",
 						Model:        "chat-model",
-						Usage:        usage,
+						Usage:        testutil.MustReportedUsage(usage),
 						FinishReason: llm.FinishStop,
 					},
 					"tool-model": {
 						Model:        "tool-model",
-						Usage:        usage,
+						Usage:        testutil.MustReportedUsage(usage),
 						FinishReason: llm.FinishToolCall,
 						ToolCalls:    []llm.ToolCall{toolCall},
 					},
 					"cancel-model": {
 						Content:      "should not be returned after cancel",
 						Model:        "cancel-model",
-						Usage:        usage,
+						Usage:        testutil.MustReportedUsage(usage),
 						FinishReason: llm.FinishStop,
 					},
 				},
@@ -118,7 +118,7 @@ func TestFakeProviderContract(t *testing.T) {
 		WantChat: llm.ChatResponse{
 			Content:      "hello from fake",
 			Model:        "chat-model",
-			Usage:        usage,
+			Usage:        testutil.MustReportedUsage(usage),
 			FinishReason: llm.FinishStop,
 		},
 		ToolRequest: &llm.ChatRequest{
@@ -216,7 +216,7 @@ func TestOpenAIProviderContract(t *testing.T) {
 		WantChat: llm.ChatResponse{
 			Content:      "hello from openai adapter",
 			Model:        "chat-model",
-			Usage:        usage,
+			Usage:        testutil.MustReportedUsage(usage),
 			FinishReason: llm.FinishStop,
 		},
 		ToolRequest: &llm.ChatRequest{
@@ -618,8 +618,10 @@ func assertChatResponse(t *testing.T, got *llm.ChatResponse, want llm.ChatRespon
 	if got.FinishReason != want.FinishReason {
 		t.Fatalf("FinishReason = %q, want %q", got.FinishReason, want.FinishReason)
 	}
-	if got.Usage != want.Usage {
-		t.Fatalf("Usage = %#v, want %#v", got.Usage, want.Usage)
+	gotUsage, gotReported := got.Usage.Summary()
+	wantUsage, wantReported := want.Usage.Summary()
+	if got.Usage.Availability() != want.Usage.Availability() || gotReported != wantReported || gotUsage != wantUsage {
+		t.Fatalf("Usage availability/summary = %q/%#v, want %q/%#v", got.Usage.Availability(), gotUsage, want.Usage.Availability(), wantUsage)
 	}
 }
 

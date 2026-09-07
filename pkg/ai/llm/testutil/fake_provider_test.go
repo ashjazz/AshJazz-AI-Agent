@@ -14,6 +14,7 @@ func TestFakeProviderReturnsDeepCopies(t *testing.T) {
 	provider := NewFakeProvider(FakeProviderConfig{
 		ChatResponses: map[string]llm.ChatResponse{
 			"tool-model": {
+				Usage: MustReportedUsage(llm.Usage{}),
 				ToolCalls: []llm.ToolCall{
 					{
 						ID:   "call-1",
@@ -65,7 +66,7 @@ func TestFakeProviderCoversConfiguredBehaviors(t *testing.T) {
 		StreamChunks: map[string][]llm.ChatChunk{
 			"stream-model": {
 				{DeltaContent: "hello"},
-				{Usage: &llm.Usage{TotalTokens: 1}},
+				{Usage: &llm.Usage{InputTokens: 1, TotalTokens: 1}},
 			},
 		},
 		StreamErrors: map[string]error{

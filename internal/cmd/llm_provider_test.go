@@ -11,13 +11,15 @@ import (
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
 	"github.com/ashjazz/Longtermism/pkg/ai/llm/openai"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
+	"github.com/ashjazz/Longtermism/pkg/ai/resilience"
 )
 
 const t069Secret = "T069_SECRET_MUST_NOT_LEAK"
 
 func TestBuildLLMProviderDisabledUsesOfflineProviderWithoutReadingEnvironment(t *testing.T) {
-	var lookupCalls, factoryCalls int
-	offline := &scriptedLLMProvider{response: &llm.ChatResponse{Content: "offline", Model: "offline-model"}}
+	var lookupCalls, factoryCalls, observerFactoryCalls int
+	offline := &scriptedLLMProvider{response: &llm.ChatResponse{Content: "offline", Model: "offline-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{})}}
 
 	provider, snapshot, err := BuildLLMProvider(context.Background(), LLMProviderConfigInput{ChatEnabled: false}, LLMProviderDependencies{
 		LookupEnv: func(string) string { lookupCalls++; return t069Secret },
@@ -25,13 +27,17 @@ func TestBuildLLMProviderDisabledUsesOfflineProviderWithoutReadingEnvironment(t 
 			factoryCalls++
 			return nil, errors.New("must not construct provider")
 		},
+		NewAttemptObserver: func(LLMProviderConfigSnapshot) (resilience.ProviderAttemptObserver, error) {
+			observerFactoryCalls++
+			return &providerAttemptRecorder{}, nil
+		},
 		NewOfflineFake: func() llm.Provider { return offline },
 	})
 	if err != nil {
 		t.Fatalf("BuildLLMProvider() error = %v", err)
 	}
-	if lookupCalls != 0 || factoryCalls != 0 {
-		t.Fatalf("disabled chat reads=%d factories=%d, want both zero", lookupCalls, factoryCalls)
+	if lookupCalls != 0 || factoryCalls != 0 || observerFactoryCalls != 0 {
+		t.Fatalf("disabled chat reads=%d provider_factories=%d observer_factories=%d, want all zero", lookupCalls, factoryCalls, observerFactoryCalls)
 	}
 	if snapshot.Enabled || snapshot.CredentialPresent || snapshot.BaseURLPresent {
 		t.Fatalf("disabled chat snapshot = %#v, want no configured provider", snapshot)
@@ -39,6 +45,59 @@ func TestBuildLLMProviderDisabledUsesOfflineProviderWithoutReadingEnvironment(t 
 	response, err := provider.Chat(context.Background(), validLLMChatRequest())
 	if err != nil || response.Content != "offline" || offline.chatCalls != 1 {
 		t.Fatalf("offline provider result=%#v error=%v calls=%d", response, err, offline.chatCalls)
+	}
+}
+
+func TestBuildLLMProviderInjectsOneAttemptObserverIntoResilienceWrapper(t *testing.T) {
+	baseProvider := &scriptedLLMProvider{
+		name: "openai-compatible",
+		response: &llm.ChatResponse{
+			Content:      "ok",
+			Model:        "chat-model",
+			FinishReason: llm.FinishStop,
+			Usage:        llmtestutil.MustReportedUsage(llm.Usage{}),
+		},
+	}
+	recorder := &providerAttemptRecorder{}
+	observerFactoryCalls := 0
+
+	provider, snapshot, err := BuildLLMProvider(
+		context.Background(),
+		enabledLLMProviderInput("OPENAI_BASE_URL", "OPENAI_API_KEY", "chat-model"),
+		LLMProviderDependencies{
+			LookupEnv: lookupEnv(map[string]string{
+				"OPENAI_BASE_URL": "https://api.example.test/v1",
+				"OPENAI_API_KEY":  t069Secret,
+			}),
+			NewOpenAI: func(openai.Config) (llm.Provider, error) { return baseProvider, nil },
+			NewAttemptObserver: func(got LLMProviderConfigSnapshot) (resilience.ProviderAttemptObserver, error) {
+				observerFactoryCalls++
+				if !got.Enabled || got.Provider != "openai" || got.DefaultModel != "chat-model" || !got.CredentialPresent || !got.BaseURLPresent {
+					t.Fatalf("attempt observer snapshot = %#v, want validated low-sensitivity provider facts", got)
+				}
+				return recorder, nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("BuildLLMProvider() error = %v", err)
+	}
+	if observerFactoryCalls != 1 {
+		t.Fatalf("attempt observer factory calls = %d, want 1", observerFactoryCalls)
+	}
+	if snapshot.DefaultModel != "chat-model" {
+		t.Fatalf("provider snapshot = %#v, want configured model", snapshot)
+	}
+
+	response, err := provider.Chat(context.Background(), validLLMChatRequest())
+	if err != nil || response != baseProvider.response {
+		t.Fatalf("assembled provider response/error = %p/%v, want %p/nil", response, err, baseProvider.response)
+	}
+	if baseProvider.chatCalls != 1 || len(recorder.facts) != 1 {
+		t.Fatalf("network attempts=%d observed facts=%d, want 1/1", baseProvider.chatCalls, len(recorder.facts))
+	}
+	if fact := recorder.facts[0]; fact.Provider() != "openai-compatible" || fact.RequestedModel() != "chat-model" || fact.Outcome() != resilience.ProviderAttemptSucceeded {
+		t.Fatalf("observed attempt fact = provider:%q requested_model:%q outcome:%q", fact.Provider(), fact.RequestedModel(), fact.Outcome())
 	}
 }
 
@@ -75,7 +134,7 @@ func TestBuildLLMProviderEnabledFailsFastForMissingConfiguration(t *testing.T) {
 }
 
 func TestBuildLLMProviderConfiguresSafeTransportAndExecutionPolicy(t *testing.T) {
-	providerStub := &scriptedLLMProvider{response: &llm.ChatResponse{Content: "ok", Model: "chat-model"}}
+	providerStub := &scriptedLLMProvider{response: &llm.ChatResponse{Content: "ok", Model: "chat-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{})}}
 	var factoryConfig openai.Config
 	provider, snapshot, err := BuildLLMProvider(context.Background(), enabledLLMProviderInput("OPENAI_BASE_URL", "OPENAI_API_KEY", "chat-model"), LLMProviderDependencies{
 		LookupEnv: lookupEnv(map[string]string{"OPENAI_BASE_URL": "https://api.example.test/v1", "OPENAI_API_KEY": t069Secret}),
@@ -99,7 +158,7 @@ func TestBuildLLMProviderConfiguresSafeTransportAndExecutionPolicy(t *testing.T)
 }
 
 func TestBuildLLMProviderUsesInjectedFakeWithoutExternalCallsOrSecretLeakage(t *testing.T) {
-	fake := &scriptedLLMProvider{response: &llm.ChatResponse{Content: "fake", Model: "chat-model"}}
+	fake := &scriptedLLMProvider{response: &llm.ChatResponse{Content: "fake", Model: "chat-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{})}}
 	networkCalls := 0
 	provider, snapshot, err := BuildLLMProvider(context.Background(), enabledLLMProviderInput("OPENAI_BASE_URL", "OPENAI_API_KEY", "chat-model"), LLMProviderDependencies{
 		LookupEnv: lookupEnv(map[string]string{"OPENAI_BASE_URL": "https://api.example.test/v1", "OPENAI_API_KEY": t069Secret}),
@@ -190,16 +249,27 @@ func validLLMChatRequest() *llm.ChatRequest {
 }
 
 type scriptedLLMProvider struct {
-	response  *llm.ChatResponse
-	chatCalls int
+	name       string
+	response   *llm.ChatResponse
+	chatErrors []error
+	chatCalls  int
 }
 
-func (*scriptedLLMProvider) Name() string { return "scripted" }
+func (p *scriptedLLMProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "scripted"
+}
 func (*scriptedLLMProvider) Capabilities(string) llm.ProviderCapabilities {
 	return llm.ProviderCapabilities{}
 }
 func (p *scriptedLLMProvider) Chat(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
+	call := p.chatCalls
 	p.chatCalls++
+	if call < len(p.chatErrors) && p.chatErrors[call] != nil {
+		return nil, p.chatErrors[call]
+	}
 	return p.response, nil
 }
 func (*scriptedLLMProvider) ChatStream(context.Context, *llm.ChatRequest) (<-chan llm.ChatChunk, error) {
@@ -209,3 +279,12 @@ func (*scriptedLLMProvider) ChatStream(context.Context, *llm.ChatRequest) (<-cha
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return fn(request) }
+
+type providerAttemptRecorder struct {
+	facts []resilience.ProviderAttemptFact
+}
+
+func (recorder *providerAttemptRecorder) ObserveProviderAttempt(fact resilience.ProviderAttemptFact) error {
+	recorder.facts = append(recorder.facts, fact)
+	return nil
+}

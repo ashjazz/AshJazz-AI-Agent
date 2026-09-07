@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -629,6 +631,76 @@ func TestProviderChatRequiresExplicitConsistentUsage(t *testing.T) {
 	}
 }
 
+// 成功状态码不使正文可信：超大响应、第二个 JSON 和工具参数错误都必须在
+// adapter 内终止，不能让正文或 provider 控制的 tool-call ID 进入错误链。
+func TestProviderChatRejectsUnsafeSuccessfulBody(t *testing.T) {
+	t.Parallel()
+	valid := openAIChatResponseWithUsageForTest(true, `{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`)
+	tests := []struct{ name, body string }{
+		{"oversized content", strings.Replace(valid, "raw-t205-provider-body", strings.Repeat("x", (1<<20)+1), 1)},
+		{"second JSON", valid + `{ "secret-upstream-marker": true }`},
+		{"trailing garbage", valid + "secret-upstream-marker"},
+		{"invalid tool arguments", `{"choices":[{"message":{"tool_calls":[{"id":"secret-upstream-marker","function":{"name":"lookup","arguments":"[invalid"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				// 超限时客户端主动关流可能导致 write 失败，此处只验证客户端契约。
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(server.Close)
+			provider, err := NewProvider(Config{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := provider.Chat(context.Background(), &llm.ChatRequest{
+				Model: "test-model", Messages: []llm.Message{{Role: llm.RoleUser, Content: "hello"}},
+			})
+			if response != nil || !errors.Is(err, llm.ErrInvalidResponse) {
+				t.Fatalf("Chat() response_present=%v error=%v, want nil/invalid response", response != nil, err)
+			}
+			var classified interface{ Class() string }
+			if !errors.As(err, &classified) || classified.Class() != "invalid_response" {
+				t.Error("error lacks stable invalid_response class")
+			}
+			if strings.Contains(err.Error(), "secret-upstream-marker") {
+				t.Error("error leaked upstream content")
+			}
+		})
+	}
+}
+
+// 响应头已到达后的读失败仍是传输故障，不能误报为 usage/schema 无效；
+// 但任意 reader 错误文本也不能越过 adapter。
+func TestParseChatResponsePreservesSafeReadFailureCategory(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		cause    error
+		want     error
+		upstream bool
+	}{
+		{"cancelled", context.Canceled, context.Canceled, false},
+		{"deadline", context.DeadlineExceeded, context.DeadlineExceeded, true},
+		{"connection interrupted", io.ErrUnexpectedEOF, llm.ErrUpstream, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := parseChatResponse(&http.Response{StatusCode: http.StatusOK,
+				Body: io.NopCloser(chatBodyErrorReader{fmt.Errorf("secret-upstream-marker: %w", tt.cause)}),
+			})
+			if response != nil || !errors.Is(err, tt.want) || errors.Is(err, llm.ErrUpstream) != tt.upstream {
+				t.Fatalf("read failure lost category: response_present=%v error=%v", response != nil, err)
+			}
+			if errors.Is(err, llm.ErrInvalidResponse) || strings.Contains(err.Error(), "secret-upstream-marker") {
+				t.Fatal("read failure misclassified or raw error leaked")
+			}
+		})
+	}
+}
+
+type chatBodyErrorReader struct{ err error }
+
+func (reader chatBodyErrorReader) Read([]byte) (int, error) { return 0, reader.err }
+
 func TestProviderChatPreservesOptionalResponseDefaultsWithExplicitZeroUsage(t *testing.T) {
 	t.Parallel()
 
@@ -1011,7 +1083,7 @@ func TestProviderChatMapsHTTPStatusErrors(t *testing.T) {
 	}
 }
 
-func TestProviderChatHTTPErrorKeepsDiagnosticContextWithoutSecret(t *testing.T) {
+func TestProviderChatHTTPErrorKeepsOnlyStatusWithoutBody(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1052,13 +1124,14 @@ func TestProviderChatHTTPErrorKeepsDiagnosticContextWithoutSecret(t *testing.T) 
 	}
 
 	errorText := err.Error()
-	for _, want := range []string{"429", "rate_limit_error", "quota exhausted"} {
-		if !strings.Contains(errorText, want) {
-			t.Fatalf("error = %q, want diagnostic fragment %q", errorText, want)
-		}
+	if !strings.Contains(errorText, "429") {
+		t.Fatal("HTTP error lost numeric status")
 	}
-	if strings.Contains(errorText, "secret-test-api-key") {
-		t.Fatalf("error = %q, want no API key leakage", errorText)
+	// 旧断言要求回显供应商 message/type，不能用该不安全契约保护泄露行为。
+	for _, forbidden := range []string{"rate_limit_error", "quota exhausted", "secret-test-api-key"} {
+		if strings.Contains(errorText, forbidden) {
+			t.Fatal("HTTP error leaked body or credential")
+		}
 	}
 }
 

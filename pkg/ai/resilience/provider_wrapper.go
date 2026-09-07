@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
@@ -15,6 +16,45 @@ import (
 // not retryable but whose original text is untrusted. It prevents upstream response bodies from
 // crossing the resilience boundary while allowing callers to distinguish rejection from outage.
 var ErrProviderRejected = errors.New("resilience: provider rejected request")
+
+// ProviderAttemptFact 是一次真实底层 provider adapter 调用的低敏、不可变快照。
+//
+// 字段保持私有，避免 observer 改写既有证据；同时刻意不携带 context、请求、响应或
+// 原始 error，防止 prompt、凭据、endpoint 和供应商正文进入指标旁路。
+type ProviderAttemptFact struct {
+	provider         string
+	requestedModel   string
+	actualModel      string
+	startedAt        time.Time
+	duration         time.Duration
+	outcome          ProviderAttemptOutcome
+	usage            llm.ProviderUsage
+	costAvailability ProviderAttemptCostAvailability
+}
+
+func (f ProviderAttemptFact) Provider() string { return f.provider }
+
+func (f ProviderAttemptFact) RequestedModel() string { return f.requestedModel }
+
+func (f ProviderAttemptFact) ActualModel() string { return f.actualModel }
+
+func (f ProviderAttemptFact) StartedAt() time.Time { return f.startedAt }
+
+func (f ProviderAttemptFact) Duration() time.Duration { return f.duration }
+
+func (f ProviderAttemptFact) Outcome() ProviderAttemptOutcome { return f.outcome }
+
+func (f ProviderAttemptFact) Usage() llm.ProviderUsage { return f.usage }
+
+func (f ProviderAttemptFact) CostAvailability() ProviderAttemptCostAvailability {
+	return f.costAvailability
+}
+
+// ProviderAttemptObserver 是 resilience 内核面向 metrics/telemetry adapter 的窄端口。
+// observer 的错误或 panic 都不能反向改变模型调用、重试、熔断和流式输出语义。
+type ProviderAttemptObserver interface {
+	ObserveProviderAttempt(ProviderAttemptFact) error
+}
 
 // ProviderWrapper 用断路器保护 llm.Provider。
 //
@@ -27,6 +67,7 @@ type ProviderWrapper struct {
 	feature         string
 	now             func() time.Time
 	executionPolicy *ProviderExecutionPolicy
+	attemptObserver ProviderAttemptObserver
 	withTimeout     func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	sleep           func(context.Context, time.Duration) error
 }
@@ -82,6 +123,13 @@ func WithExecutionPolicy(policy ProviderExecutionPolicy) ProviderWrapperOption {
 	return func(wrapper *ProviderWrapper) {
 		copy := policy
 		wrapper.executionPolicy = &copy
+	}
+}
+
+// WithProviderAttemptObserver 配置每次真实 provider 网络尝试的事实出口。
+func WithProviderAttemptObserver(observer ProviderAttemptObserver) ProviderWrapperOption {
+	return func(wrapper *ProviderWrapper) {
+		wrapper.attemptObserver = observer
 	}
 }
 
@@ -205,20 +253,27 @@ func (p *ProviderWrapper) executeChat(ctx context.Context, req *llm.ChatRequest,
 	executionCtx, cancel := p.executionContext(ctx)
 	defer cancel()
 	return p.executeWithRetry(executionCtx, func(attemptCtx context.Context) error {
+		attempt := p.beginProviderAttempt(req)
 		got, err := p.provider.Chat(attemptCtx, req)
+		attempt.finishChat(attemptCtx, got, err)
 		*response = got
 		return err
 	})
 }
 
-func (p *ProviderWrapper) executeStream(ctx context.Context, req *llm.ChatRequest, forwarded chan<- llm.ChatChunk, signalStarted func(error)) error {
+func (p *ProviderWrapper) executeStream(ctx context.Context, req *llm.ChatRequest, forwarded chan<- llm.ChatChunk, signalStarted func(error)) (resultErr error) {
 	executionCtx, cancel := p.executionContext(ctx)
 	defer cancel()
 
-	source, first, err := p.openStreamBeforeFirstOutput(executionCtx, req)
+	source, first, attempt, err := p.openStreamBeforeFirstOutput(executionCtx, req)
 	if err != nil {
 		signalStarted(sanitizeProviderError(err))
 		return err
+	}
+	if attempt != nil {
+		defer func() {
+			attempt.finishStream(executionCtx, resultErr)
+		}()
 	}
 	signalStarted(nil)
 	if first != nil {
@@ -237,6 +292,9 @@ func (p *ProviderWrapper) executeStream(ctx context.Context, req *llm.ChatReques
 			if !open {
 				return nil
 			}
+			if attempt != nil {
+				attempt.captureStreamUsage(chunk.Usage)
+			}
 			if err := p.forwardStreamChunk(executionCtx, forwarded, chunk); err != nil {
 				return p.streamContextError(ctx, executionCtx, forwarded)
 			}
@@ -250,35 +308,45 @@ func (p *ProviderWrapper) executeStream(ctx context.Context, req *llm.ChatReques
 // openStreamBeforeFirstOutput owns the only replay-safe stream retry window. A failed HTTP/SSE
 // connection or an upstream terminal event before any chunk is forwarded can be retried; once a
 // chunk crosses this wrapper boundary, replay could duplicate text or tool-call side effects.
-func (p *ProviderWrapper) openStreamBeforeFirstOutput(ctx context.Context, req *llm.ChatRequest) (<-chan llm.ChatChunk, *llm.ChatChunk, error) {
+func (p *ProviderWrapper) openStreamBeforeFirstOutput(ctx context.Context, req *llm.ChatRequest) (<-chan llm.ChatChunk, *llm.ChatChunk, *providerNetworkAttempt, error) {
 	for attempt := 0; ; attempt++ {
+		networkAttempt := p.beginProviderAttempt(req)
 		source, err := p.provider.ChatStream(ctx, req)
 		if err == nil && source == nil {
+			networkAttempt.markInvalidResponse()
+			// 业务路径沿用既有 upstream 分类以保持 retry/breaker 语义；attempt fact 则记录
+			// 更准确的 invalid_response，避免把 provider 契约违规误算成网络失败。
+			networkAttempt.finishStream(ctx, llm.ErrInvalidResponse)
 			err = fmt.Errorf("provider returned an empty stream: %w", llm.ErrUpstream)
 		}
 		if err != nil {
+			networkAttempt.finishStream(ctx, err)
 			if retry, retryErr := p.retryBeforeFirstOutput(ctx, attempt, err); retry {
 				continue
 			} else {
-				return nil, nil, retryErr
+				return nil, nil, nil, retryErr
 			}
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+			networkAttempt.finishStream(ctx, ctx.Err())
+			return nil, nil, nil, ctx.Err()
 		case first, open := <-source:
 			if !open {
-				return source, nil, nil
+				networkAttempt.finishStream(ctx, nil)
+				return source, nil, nil, nil
 			}
+			networkAttempt.captureStreamUsage(first.Usage)
 			if first.Err != nil {
+				networkAttempt.finishStream(ctx, first.Err)
 				if retry, retryErr := p.retryBeforeFirstOutput(ctx, attempt, first.Err); retry {
 					continue
 				} else {
-					return nil, nil, retryErr
+					return nil, nil, nil, retryErr
 				}
 			}
-			return source, &first, nil
+			return source, &first, networkAttempt, nil
 		}
 	}
 }
@@ -355,6 +423,9 @@ func sanitizeProviderError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return context.DeadlineExceeded
 	}
+	if errors.Is(err, llm.ErrInvalidResponse) {
+		return llm.ErrInvalidResponse
+	}
 	if errors.Is(err, llm.ErrRateLimit) {
 		return fmt.Errorf("provider request failed: %w", errors.Join(llm.ErrUpstream, llm.ErrRateLimit))
 	}
@@ -365,6 +436,110 @@ func sanitizeProviderError(err error) error {
 		return err
 	}
 	return ErrProviderRejected
+}
+
+// providerNetworkAttempt 的生命周期覆盖一次 adapter 调用直至其真实终态。
+// 流式调用不能在收到 HTTP/SSE channel 时提前成功：只有 terminal chunk、关闭或错误
+// 才能结算，以免把“连接建立成功但消费失败”误记为成功。
+type providerNetworkAttempt struct {
+	wrapper         *ProviderWrapper
+	provider        string
+	requestedModel  string
+	startedAt       time.Time
+	usage           llm.ProviderUsage
+	invalidResponse bool
+	once            sync.Once
+}
+
+func (p *ProviderWrapper) beginProviderAttempt(req *llm.ChatRequest) *providerNetworkAttempt {
+	return &providerNetworkAttempt{
+		wrapper:        p,
+		provider:       p.Name(),
+		requestedModel: requestedModel(req),
+		startedAt:      p.now(),
+		usage:          llm.NewUnavailableProviderUsage(),
+	}
+}
+
+func (a *providerNetworkAttempt) markInvalidResponse() {
+	if a != nil {
+		a.invalidResponse = true
+	}
+}
+
+func (a *providerNetworkAttempt) captureStreamUsage(summary *llm.Usage) {
+	if a == nil || summary == nil {
+		return
+	}
+	usage, err := llm.NewReportedProviderUsage(*summary)
+	if err != nil {
+		a.invalidResponse = true
+		a.usage = llm.NewUnavailableProviderUsage()
+		return
+	}
+	a.usage = usage
+}
+
+func (a *providerNetworkAttempt) finishChat(ctx context.Context, response *llm.ChatResponse, err error) {
+	if a == nil {
+		return
+	}
+	outcome := providerChatAttemptOutcome(response, providerAttemptTerminalError(ctx, err))
+	actual := ""
+	usage := llm.NewUnavailableProviderUsage()
+	if outcome == ProviderAttemptSucceeded {
+		actual = actualModel(response)
+		if response.Usage.Availability() == llm.UsageReported {
+			usage = response.Usage
+		}
+	}
+	a.finish(outcome, actual, usage)
+}
+
+func (a *providerNetworkAttempt) finishStream(ctx context.Context, err error) {
+	if a == nil {
+		return
+	}
+	outcome := providerAttemptOutcomeFromError(providerAttemptTerminalError(ctx, err))
+	if outcome == ProviderAttemptSucceeded && a.invalidResponse {
+		outcome = ProviderAttemptInvalidResponse
+	}
+	a.finish(outcome, "", a.usage)
+}
+
+func (a *providerNetworkAttempt) finish(outcome ProviderAttemptOutcome, actualModel string, usage llm.ProviderUsage) {
+	if a == nil || a.wrapper == nil {
+		return
+	}
+	a.once.Do(func() {
+		endedAt := a.wrapper.now()
+		duration := endedAt.Sub(a.startedAt)
+		if duration < 0 {
+			duration = 0
+		}
+		fact := ProviderAttemptFact{
+			provider:         a.provider,
+			requestedModel:   a.requestedModel,
+			actualModel:      actualModel,
+			startedAt:        a.startedAt,
+			duration:         duration,
+			outcome:          outcome,
+			usage:            usage,
+			costAvailability: ProviderAttemptCostUnavailable,
+		}
+		a.wrapper.observeProviderAttempt(fact)
+	})
+}
+
+func (p *ProviderWrapper) observeProviderAttempt(fact ProviderAttemptFact) {
+	if p == nil || p.attemptObserver == nil {
+		return
+	}
+	// metrics/telemetry 是旁路；局部 recover 只隔离 observer，不吞掉业务代码 panic。
+	defer func() {
+		_ = recover()
+	}()
+	_ = p.attemptObserver.ObserveProviderAttempt(fact)
 }
 
 func (p *ProviderWrapper) call(ctx context.Context, fn func(context.Context) error) providerCallResult {

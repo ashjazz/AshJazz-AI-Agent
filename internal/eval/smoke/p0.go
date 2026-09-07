@@ -87,7 +87,10 @@ func RunP0(ctx context.Context, config Config) (Result, error) {
 	}
 
 	if cfg.Provider == nil {
-		cfg.Provider = newGoldenFakeProvider(cfg.Model, samples)
+		cfg.Provider, err = newGoldenFakeProvider(cfg.Model, samples)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 	template, err := cfg.PromptRegistry.Get(ctx, cfg.PromptName, cfg.PromptVersion)
 	if err != nil {
@@ -186,11 +189,20 @@ func predictSample(ctx context.Context, cfg Config, template prompt.Template, sa
 		return aieval.Prediction{}, fmt.Errorf("call p0 smoke fake llm for sample %q: %w", sample.ID, err)
 	}
 
-	recordTrace(ctx, cfg, identity, sample, rendered, response.Model, response.Usage, startedAt, successStatus)
+	if response == nil {
+		recordTrace(ctx, cfg, identity, sample, rendered, request.Model, llm.Usage{}, startedAt, failedStatus)
+		return aieval.Prediction{}, llm.ErrInvalidResponse
+	}
+	usage, reported := response.Usage.Summary()
+	if !reported {
+		recordTrace(ctx, cfg, identity, sample, rendered, request.Model, llm.Usage{}, startedAt, failedStatus)
+		return aieval.Prediction{}, llm.ErrInvalidResponse
+	}
+	recordTrace(ctx, cfg, identity, sample, rendered, response.Model, usage, startedAt, successStatus)
 	return aieval.Prediction{
 		Answer:        response.Content,
 		Context:       append([]string(nil), sample.RelevantCtx...),
-		TokensUsed:    response.Usage.TotalTokens,
+		TokensUsed:    usage.TotalTokens,
 		TraceIdentity: identity,
 	}, nil
 }
@@ -300,21 +312,25 @@ type goldenFakeProvider struct {
 	responses map[string]llm.ChatResponse
 }
 
-func newGoldenFakeProvider(baseModel string, samples []aieval.Sample) *goldenFakeProvider {
+func newGoldenFakeProvider(baseModel string, samples []aieval.Sample) (*goldenFakeProvider, error) {
 	responses := make(map[string]llm.ChatResponse, len(samples))
 	for _, sample := range samples {
 		model := sampleModel(baseModel, sample.ID)
+		usage, err := llm.NewReportedProviderUsage(usageForSample(sample))
+		if err != nil {
+			return nil, err
+		}
 		responses[model] = llm.ChatResponse{
 			Content:      sample.GroundTruth,
 			Model:        model,
-			Usage:        usageForSample(sample),
+			Usage:        usage,
 			FinishReason: llm.FinishStop,
 		}
 	}
 	return &goldenFakeProvider{
 		baseModel: baseModel,
 		responses: responses,
-	}
+	}, nil
 }
 
 func (p *goldenFakeProvider) Name() string {

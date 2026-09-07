@@ -7,6 +7,8 @@ import (
 	"math"
 	"time"
 
+	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	"github.com/ashjazz/Longtermism/pkg/ai/resilience"
 	"go.opentelemetry.io/otel/attribute"
 	metricapi "go.opentelemetry.io/otel/metric"
 )
@@ -27,9 +29,11 @@ const (
 const metricOtherLabelValue = "other"
 
 var (
-	allowedHTTPMethods        = metricLabelSet("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
-	allowedProviders          = metricLabelSet("openai-compatible")
-	allowedOutcomes           = metricLabelSet("succeeded", "failed", "cancelled", "timeout")
+	allowedHTTPMethods = metricLabelSet("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+	// openai 是当前生产 adapter 的稳定 Name()；openai-compatible 保留给已校验的
+	// 通用兼容 provider 配置。二者均是有限枚举，未知供应商仍收敛为 other。
+	allowedProviders          = metricLabelSet("openai", "openai-compatible")
+	allowedOutcomes           = metricLabelSet("succeeded", "failed", "cancelled", "timeout", "invalid_response")
 	allowedCurrencies         = metricLabelSet("USD")
 	allowedEstimates          = metricLabelSet("estimated", "actual", "unavailable")
 	allowedEvaluators         = metricLabelSet("deterministic", "llm_judge")
@@ -102,21 +106,23 @@ type HTTPMetric struct {
 // LLMMetric describes one provider attempt. Requested and actual models have distinct
 // lifecycles: routing determines the requested model, while provider output records the actual one.
 type LLMMetric struct {
-	Provider       string
-	RequestedModel string
-	ActualModel    string
-	Outcome        string
-	Duration       time.Duration
-	InputTokens    int64
-	OutputTokens   int64
-	Cost           float64
-	Currency       string
-	EstimateStatus string
-	AITraceID      string
-	SessionID      string
-	TraceID        string
-	SpanID         string
-	PromptHash     string
+	Provider          string
+	RequestedModel    string
+	ActualModel       string
+	Outcome           string
+	Duration          time.Duration
+	UsageAvailability llm.UsageAvailability
+	InputTokens       int64
+	OutputTokens      int64
+	CostAvailability  resilience.ProviderAttemptCostAvailability
+	Cost              float64
+	Currency          string
+	EstimateStatus    string
+	AITraceID         string
+	SessionID         string
+	TraceID           string
+	SpanID            string
+	PromptHash        string
 }
 
 // EvalMetric captures local evaluation results without promoting evidence identities to labels.
@@ -219,15 +225,41 @@ func (m *Metrics) RecordHTTP(ctx context.Context, input HTTPMetric) error {
 }
 
 func (m *Metrics) RecordLLM(ctx context.Context, input LLMMetric) error {
-	if input.Duration < 0 || input.InputTokens < 0 || input.OutputTokens < 0 || !isFiniteNonNegative(input.Cost) {
+	if err := validateLLMMetric(input); err != nil {
 		return ErrInvalidMetricValue
 	}
 	m.llmRequests.Add(ctx, 1, metricapi.WithAttributes(m.llmRequestAttributes(input)...))
 	m.llmDuration.Record(ctx, input.Duration.Seconds(), metricapi.WithAttributes(m.llmRequestAttributes(input)...))
-	m.llmTokens.Add(ctx, input.InputTokens, metricapi.WithAttributes(m.llmTokenAttributes(input, "input")...))
-	m.llmTokens.Add(ctx, input.OutputTokens, metricapi.WithAttributes(m.llmTokenAttributes(input, "output")...))
-	m.llmCost.Add(ctx, input.Cost, metricapi.WithAttributes(m.llmCostAttributes(input)...))
+	// Availability 是领域事实的一部分：unavailable 不是合法的数值零，不能执行
+	// Add(0) 制造一个“provider 明确报告零 token/成本”的时序。
+	if input.UsageAvailability == llm.UsageReported {
+		m.llmTokens.Add(ctx, input.InputTokens, metricapi.WithAttributes(m.llmTokenAttributes(input, "input")...))
+		m.llmTokens.Add(ctx, input.OutputTokens, metricapi.WithAttributes(m.llmTokenAttributes(input, "output")...))
+	}
+	if input.CostAvailability == resilience.ProviderAttemptCostActual ||
+		input.CostAvailability == resilience.ProviderAttemptCostEstimated {
+		m.llmCost.Add(ctx, input.Cost, metricapi.WithAttributes(m.llmCostAttributes(input)...))
+	}
 	return nil
+}
+
+func validateLLMMetric(input LLMMetric) error {
+	if input.Duration < 0 || input.InputTokens < 0 || input.OutputTokens < 0 || !isFiniteNonNegative(input.Cost) {
+		return ErrInvalidMetricValue
+	}
+	switch input.UsageAvailability {
+	case llm.UsageUnavailable, llm.UsageReported:
+	default:
+		return ErrInvalidMetricValue
+	}
+	switch input.CostAvailability {
+	case resilience.ProviderAttemptCostUnavailable,
+		resilience.ProviderAttemptCostActual,
+		resilience.ProviderAttemptCostEstimated:
+		return nil
+	default:
+		return ErrInvalidMetricValue
+	}
 }
 
 func (m *Metrics) RecordEval(ctx context.Context, input EvalMetric) error {

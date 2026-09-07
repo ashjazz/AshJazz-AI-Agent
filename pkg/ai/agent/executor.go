@@ -104,7 +104,14 @@ func (e *NativeExecutor) Run(ctx context.Context, req Request) (Result, error) {
 			return result, fmt.Errorf("agent provider chat: %w", err)
 		}
 
-		result.TokensUsed += response.Usage.TotalTokens
+		if response == nil {
+			return result, llm.ErrInvalidResponse
+		}
+		usage, reported := response.Usage.Summary()
+		if !reported {
+			return result, llm.ErrInvalidResponse
+		}
+		result.TokensUsed += usage.TotalTokens
 		if exceededTokenBudget(result.TokensUsed, limit.TokenBudget) {
 			result.TerminatedBy = terminatedBudgetExceeded
 			e.recordAgentObservation(ctx, agentObservation{

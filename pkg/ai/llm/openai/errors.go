@@ -1,19 +1,15 @@
 package openai
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
 )
 
-type openAIErrorResponse struct {
-	Error openAIErrorBody `json:"error"`
-}
-
+// openAIErrorBody 仅供已建立的 2xx SSE 流解析内嵌 error 事件。
+// 初始非 2xx HTTP 响应不再读取或解析该结构。
 type openAIErrorBody struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
@@ -24,46 +20,19 @@ type openAIErrorBody struct {
 //
 // 429/5xx 属于可重试或可降级的上游错误，必须包装 llm.ErrUpstream；
 // 400/401/403 这类调用方、认证或权限问题不能进入重试/熔断路径。
-// 错误文本只保留 status/type/code/message，不包含 Authorization header 或 API key。
+// 失败正文、Status 文本和 headers 都是供应商控制的输入，可能回显 prompt 或
+// 凭据，因此只保留数值状态码和稳定 sentinel。这里不读取正文，也不为连接
+// 复用执行 drain，避免超大/阻塞正文拖延失败路径；关闭仍由 Chat/ChatStream 负责。
 func classifyHTTPStatusError(resp *http.Response) error {
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		return nil
 	}
 
-	body := decodeErrorBody(resp)
-	message := buildHTTPErrorMessage(resp.StatusCode, body)
+	message := fmt.Sprintf("openai chat request failed with status %d", resp.StatusCode)
 	if isRetryableHTTPStatus(resp.StatusCode) {
 		return fmt.Errorf("%s: %w", message, llm.ErrUpstream)
 	}
 	return errors.New(message)
-}
-
-func decodeErrorBody(resp *http.Response) openAIErrorBody {
-	if resp == nil || resp.Body == nil {
-		return openAIErrorBody{}
-	}
-
-	var decoded openAIErrorResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return openAIErrorBody{}
-	}
-	return decoded.Error
-}
-
-func buildHTTPErrorMessage(statusCode int, body openAIErrorBody) string {
-	parts := []string{
-		fmt.Sprintf("openai chat request failed with status %d", statusCode),
-	}
-	if body.Type != "" {
-		parts = append(parts, "type "+body.Type)
-	}
-	if body.Code != "" {
-		parts = append(parts, "code "+body.Code)
-	}
-	if body.Message != "" {
-		parts = append(parts, "message "+body.Message)
-	}
-	return strings.Join(parts, ": ")
 }
 
 func isRetryableHTTPStatus(statusCode int) bool {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 )
 
 // T116 模型与观测失败域分离契约测试（RED 先行，T126 在 chat.go 落地
@@ -238,7 +239,7 @@ func TestExecuteTelemetryBypassFailureNeverBecomesBusinessError(t *testing.T) {
 				Content:      "business result",
 				Model:        "provider-model-v1",
 				FinishReason: llm.FinishStop,
-				Usage:        llm.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+				Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}),
 			}, nil
 		}},
 		RequestedModel:          "server-model",

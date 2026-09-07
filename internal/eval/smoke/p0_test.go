@@ -2,6 +2,7 @@ package smoke
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,30 @@ import (
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
 	obstestutil "github.com/ashjazz/Longtermism/pkg/ai/obs/testutil"
 )
+
+// 未报告 token 的响应不能进入成功 trace 或生成评估报告。
+func TestRunP0RejectsUnavailableUsage(t *testing.T) {
+	for _, usage := range []llm.ProviderUsage{{}, llm.NewUnavailableProviderUsage()} {
+		recorder := obstestutil.NewRecorder()
+		model := sampleModel("test-model", "usage-case")
+		provider := &goldenFakeProvider{responses: map[string]llm.ChatResponse{
+			model: {Model: model, Content: "untrusted answer", Usage: usage, FinishReason: llm.FinishStop},
+		}}
+		result, err := RunP0(context.Background(), Config{
+			Dataset:    evaltestutil.NewStaticDataset([]aieval.Sample{{ID: "usage-case", Query: "question", GroundTruth: "answer"}}),
+			PromptRoot: writePromptRoot(t, `{{ .Question }}`), Provider: provider, Model: "test-model", Tracer: recorder,
+		})
+		if !errors.Is(err, llm.ErrInvalidResponse) || result.Report.SampleCount != 0 {
+			t.Fatalf("RunP0() report count=%d error=%v, want no report and invalid response", result.Report.SampleCount, err)
+		}
+		recorder.AssertCount(t, 1)
+		recorder.AssertTrace(t, 0, func(t *testing.T, trace obs.Trace) {
+			if trace.OutcomeStatus == successStatus || trace.InputTokens != 0 || trace.OutputTokens != 0 {
+				t.Fatal("unavailable usage produced success/token facts")
+			}
+		})
+	}
+}
 
 func TestRunP0BuildsPromptLLMTraceEvalPath(t *testing.T) {
 	recorder := obstestutil.NewRecorder()
@@ -162,7 +187,7 @@ func TestRunP0DefaultLocalAssetsFromNestedWorkingDirectory(t *testing.T) {
 }
 
 func TestGoldenFakeProviderBoundaries(t *testing.T) {
-	provider := newGoldenFakeProvider(DefaultModel, []aieval.Sample{
+	provider, err := newGoldenFakeProvider(DefaultModel, []aieval.Sample{
 		{
 			ID:          "case-one",
 			Query:       "q",
@@ -171,6 +196,9 @@ func TestGoldenFakeProviderBoundaries(t *testing.T) {
 		},
 	})
 
+	if err != nil {
+		t.Fatal(err)
+	}
 	if provider.Name() != "p0-smoke-fake" {
 		t.Fatalf("provider name = %q, want p0-smoke-fake", provider.Name())
 	}

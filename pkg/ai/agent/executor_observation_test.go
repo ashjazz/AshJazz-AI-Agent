@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs/testutil"
 )
@@ -22,7 +23,7 @@ func TestExecutorRecordsAgentStepObservationForToolCall(t *testing.T) {
 		toolCallResponse("call-search-docs", "search_docs", map[string]any{"query": "agent observability"}),
 		llm.ChatResponse{
 			Content:      "Agent observability records native tool steps.",
-			Usage:        llm.Usage{TotalTokens: 3},
+			Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 1, OutputTokens: 2, TotalTokens: 3}),
 			FinishReason: llm.FinishStop,
 		},
 	)
@@ -109,7 +110,7 @@ func TestExecutorRecordsLoopAndBudgetTerminationObservations(t *testing.T) {
 		{
 			name: "budget exceeded records limit status before tool invocation",
 			provider: newScriptedProvider(llm.ChatResponse{
-				Usage:        llm.Usage{TotalTokens: 6},
+				Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 2, OutputTokens: 4, TotalTokens: 6}),
 				FinishReason: llm.FinishToolCall,
 				ToolCalls: []llm.ToolCall{
 					{ID: "call-budget", Name: "search_docs", Arguments: map[string]any{"query": "budget"}},

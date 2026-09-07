@@ -168,6 +168,7 @@ type ChatUsecase struct {
 
 type chatProviderExecution struct {
 	response           *llm.ChatResponse
+	usage              llm.Usage
 	canonicalModel     string
 	generationIdentity appobs.PlatformSpanIdentity
 	failureStatus      obs.FailureStatus
@@ -265,7 +266,7 @@ func (usecase *ChatUsecase) Execute(ctx context.Context, command ChatCommand) (C
 		Content:      execution.response.Content,
 		Model:        execution.canonicalModel,
 		FinishReason: execution.response.FinishReason,
-		Usage:        execution.response.Usage,
+		Usage:        execution.usage,
 		Identity:     executionIdentity,
 	}
 	usecase.writeRunManifest(executionContext, command.SmokeRunID, executionIdentity)
@@ -274,6 +275,7 @@ func (usecase *ChatUsecase) Execute(ctx context.Context, command ChatCommand) (C
 		executionIdentity,
 		execution.canonicalModel,
 		execution.response,
+		execution.usage,
 		execution.generationIdentity,
 		hasTrustedExecution,
 	)
@@ -310,7 +312,7 @@ func (usecase *ChatUsecase) executeProvider(ctx context.Context,
 		usecase.recordFailedProvider(ctx, identity, startedAt, completedAt, failureStatus, hasTrustedExecution)
 		return chatProviderExecution{failureStatus: failureStatus}, safeErr
 	}
-	canonicalModel, isValidResponse := usecase.canonicalizeProviderResponse(response)
+	canonicalModel, usage, isValidResponse := usecase.canonicalizeProviderResponse(response)
 	if !isValidResponse {
 		usecase.recordFailedProvider(ctx, identity, startedAt, completedAt, obs.FailureUpstream, hasTrustedExecution)
 		return chatProviderExecution{failureStatus: obs.FailureUpstream}, ErrChatInvalidResponse
@@ -318,11 +320,12 @@ func (usecase *ChatUsecase) executeProvider(ctx context.Context,
 	generationInput := usecase.newGenerationInput(ctx, identity, startedAt, completedAt, chatSuccessOutcome, "")
 	generationInput.ActualModel = canonicalModel
 	generationInput.FinishReason = response.FinishReason
-	generationInput.Usage = response.Usage
+	generationInput.Usage = usage
 	generationIdentity := usecase.recordGenerationObservation(ctx, generationInput, hasTrustedExecution)
-	usecase.recordTelemetry(successTrace(identity, canonicalModel, response, usecase.now()))
+	usecase.recordTelemetry(successTrace(identity, canonicalModel, usage, usecase.now()))
 	return chatProviderExecution{
 		response:           response,
+		usage:              usage,
 		canonicalModel:     canonicalModel,
 		generationIdentity: generationIdentity,
 	}, nil
@@ -462,6 +465,7 @@ func (usecase *ChatUsecase) evaluateAndPersist(
 	identity obs.CorrelationIdentity,
 	canonicalModel string,
 	response *llm.ChatResponse,
+	usage llm.Usage,
 	generationIdentity appobs.PlatformSpanIdentity,
 	hasTrustedExecution bool,
 ) *DebugEvalSummary {
@@ -481,7 +485,7 @@ func (usecase *ChatUsecase) evaluateAndPersist(
 	if !hasTrustedExecution {
 		return nil
 	}
-	execution, ok := usecase.executeEvaluation(ctx, identity, canonicalModel, response)
+	execution, ok := usecase.executeEvaluation(ctx, identity, canonicalModel, response, usage)
 	if !ok {
 		return nil
 	}
@@ -508,6 +512,7 @@ func (usecase *ChatUsecase) executeEvaluation(
 	identity obs.CorrelationIdentity,
 	canonicalModel string,
 	response *llm.ChatResponse,
+	usage llm.Usage,
 ) (chatEvaluationExecution, bool) {
 	if usecase.newEvalRunID == nil {
 		usecase.recordSideEffectFailure(chatEvaluatorComponent)
@@ -525,7 +530,7 @@ func (usecase *ChatUsecase) executeEvaluation(
 		Identity:      evaluationIdentity,
 		ActualModel:   canonicalModel,
 		FinishReason:  response.FinishReason,
-		Usage:         response.Usage,
+		Usage:         usage,
 		OutputPresent: response.Content != "",
 	})
 	completedAt := usecase.now()
@@ -686,7 +691,7 @@ func (usecase *ChatUsecase) recordTelemetry(trace obs.Trace) {
 	}
 }
 
-func successTrace(identity obs.CorrelationIdentity, canonicalModel string, response *llm.ChatResponse, timestamp time.Time) obs.Trace {
+func successTrace(identity obs.CorrelationIdentity, canonicalModel string, usage llm.Usage, timestamp time.Time) obs.Trace {
 	return obs.NewTrace(
 		identity.AITraceID,
 		chatFeature,
@@ -694,8 +699,8 @@ func successTrace(identity obs.CorrelationIdentity, canonicalModel string, respo
 		obs.WithCorrelationIdentity(identity),
 		obs.WithObservationType(obs.ObservationTypeGeneration),
 		obs.WithModel(canonicalModel),
-		obs.WithUsage(response.Usage.InputTokens, response.Usage.OutputTokens, response.Usage.ReasoningTokens),
-		obs.WithCacheUsage(response.Usage.CacheReadTokens, response.Usage.CacheWriteTokens),
+		obs.WithUsage(usage.InputTokens, usage.OutputTokens, usage.ReasoningTokens),
+		obs.WithCacheUsage(usage.CacheReadTokens, usage.CacheWriteTokens),
 		obs.WithOutcome(chatSuccessOutcome),
 	)
 }
@@ -740,10 +745,11 @@ const (
 // sentinel 链保持 controller 现有 errors.Is 语义：
 //
 //	429      -> rate_limited         (llm.ErrRateLimit + llm.ErrUpstream)
-//	5xx      -> upstream_unavailable (llm.ErrUpstream)
-//	timeout  -> upstream_timeout     (llm.ErrUpstream + context.DeadlineExceeded)
-//	canceled -> caller_canceled      (context.Canceled，不是上游故障)
-//	其它     -> provider_failure     (ErrChatProviderFailure)
+//	5xx             -> upstream_unavailable (llm.ErrUpstream)
+//	timeout         -> upstream_timeout     (llm.ErrUpstream + context.DeadlineExceeded)
+//	canceled        -> caller_canceled      (context.Canceled，不是上游故障)
+//	invalid response -> invalid_response    (ErrChatInvalidResponse)
+//	其它            -> provider_failure     (ErrChatProviderFailure)
 //
 // nil error 是 none，不产生任何错误链。
 func ClassifyChatModelFailure(err error) (ChatFailureClass, error) {
@@ -757,10 +763,12 @@ func ClassifyChatModelFailure(err error) (ChatFailureClass, error) {
 		return ChatFailureClassCallerCanceled, context.Canceled
 	case errors.Is(err, llm.ErrRateLimit):
 		return ChatFailureClassRateLimited, errors.Join(llm.ErrUpstream, llm.ErrRateLimit)
+	case errors.Is(err, llm.ErrInvalidResponse), errors.Is(err, ErrChatInvalidResponse):
+		// Provider 原始错误链可能携带响应正文或 endpoint。这里只返回应用层稳定
+		// sentinel 本身，使 controller 可以安全投影 502，同时保留既有 AI 身份。
+		return ChatFailureClassInvalidResponse, ErrChatInvalidResponse
 	case errors.Is(err, llm.ErrUpstream):
 		return ChatFailureClassUpstreamUnavailable, llm.ErrUpstream
-	case errors.Is(err, ErrChatInvalidResponse):
-		return ChatFailureClassInvalidResponse, ErrChatInvalidResponse
 	default:
 		return ChatFailureClassProviderFailure, ErrChatProviderFailure
 	}
@@ -797,22 +805,27 @@ func classifyProviderFailure(err error) (obs.FailureStatus, error) {
 	return failureStatus, safeErr
 }
 
-func (usecase *ChatUsecase) canonicalizeProviderResponse(response *llm.ChatResponse) (string, bool) {
+func (usecase *ChatUsecase) canonicalizeProviderResponse(response *llm.ChatResponse) (string, llm.Usage, bool) {
 	if response == nil ||
 		usecase == nil ||
 		usecase.canonicalizeActualModel == nil ||
 		len(response.Content) > maxChatResponseBytes {
-		return "", false
+		return "", llm.Usage{}, false
 	}
 	canonicalModel, ok := usecase.canonicalizeActualModel(response.Model)
 	if !ok || !isSafeModelIdentifier(canonicalModel) || !isSafeFinishReason(response.FinishReason) {
-		return "", false
+		return "", llm.Usage{}, false
 	}
 	if response.FinishReason == llm.FinishToolCall || len(response.ToolCalls) > 0 {
-		return "", false
+		return "", llm.Usage{}, false
 	}
 
-	usage := response.Usage
+	// 类型迁移时必须显式提取已报告事实；只把这份摘要传给后续投影，不能
+	// 解引用可选指针，或把缺失摘要的数值零值当作成功 usage。
+	usage, reported := response.Usage.Summary()
+	if !reported {
+		return "", llm.Usage{}, false
+	}
 	if usage.InputTokens < 0 ||
 		usage.OutputTokens < 0 ||
 		usage.ReasoningTokens < 0 ||
@@ -825,9 +838,9 @@ func (usecase *ChatUsecase) canonicalizeProviderResponse(response *llm.ChatRespo
 		usage.CacheWriteTokens > maxUsageTokens ||
 		usage.TotalTokens > maxUsageTokens ||
 		usage.TotalTokens < usage.InputTokens+usage.OutputTokens {
-		return "", false
+		return "", llm.Usage{}, false
 	}
-	return canonicalModel, true
+	return canonicalModel, usage, true
 }
 
 func isSafeModelIdentifier(model string) bool {

@@ -274,7 +274,8 @@ func TestProviderChatStreamMapsInitialHTTPError(t *testing.T) {
 	if !errors.Is(err, llm.ErrUpstream) {
 		t.Fatalf("ChatStream() error = %v, want errors.Is ErrUpstream", err)
 	}
-	assertErrorMentions(t, err, "stream quota exhausted")
+	// SSE 建立前的 HTTP 失败也只保留状态，不允许旁路回显错误正文。
+	assertStatusOnlyError(t, err, http.StatusTooManyRequests, true)
 }
 
 func writeStreamPayload(t *testing.T, w http.ResponseWriter, payload map[string]any) {

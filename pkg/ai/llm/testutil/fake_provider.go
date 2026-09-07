@@ -181,6 +181,7 @@ func cloneStreamChunkMap(input map[string][]llm.ChatChunk) map[string][]llm.Chat
 
 func cloneChatResponse(input llm.ChatResponse) llm.ChatResponse {
 	cloned := input
+	// ProviderUsage 只有私有不可变摘要，值拷贝不暴露可写别名。
 	cloned.ToolCalls = cloneToolCalls(input.ToolCalls)
 	return cloned
 }

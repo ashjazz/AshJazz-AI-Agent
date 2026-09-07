@@ -281,7 +281,7 @@ func replacementChatResponse() llm.ChatResponse {
 	return llm.ChatResponse{
 		Content:      "hello from openai adapter",
 		Model:        "chat-model",
-		Usage:        replacementUsage(),
+		Usage:        testutil.MustReportedUsage(replacementUsage()),
 		FinishReason: llm.FinishStop,
 	}
 }
@@ -303,7 +303,7 @@ func replacementToolRequest() *llm.ChatRequest {
 func replacementToolResponse() llm.ChatResponse {
 	return llm.ChatResponse{
 		Model:        "tool-model",
-		Usage:        replacementUsage(),
+		Usage:        testutil.MustReportedUsage(replacementUsage()),
 		FinishReason: llm.FinishToolCall,
 		ToolCalls:    []llm.ToolCall{replacementToolCall()},
 	}
@@ -348,7 +348,7 @@ func replacementCancelResponse() llm.ChatResponse {
 	return llm.ChatResponse{
 		Content:      "should not be returned after cancel",
 		Model:        "cancel-model",
-		Usage:        replacementUsage(),
+		Usage:        testutil.MustReportedUsage(replacementUsage()),
 		FinishReason: llm.FinishStop,
 	}
 }

@@ -2,13 +2,30 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 )
+
+// 没有 usage 事实时不能继续累计预算或执行工具；fake/未来 adapter 也必须
+// 在这个边界稳定失败，而不是把零值当成免费调用或触发 nil pointer panic。
+func TestExecutorRejectsUnavailableUsage(t *testing.T) {
+	for _, usage := range []llm.ProviderUsage{{}, llm.NewUnavailableProviderUsage()} {
+		tool := newLimitTool("search_docs")
+		executor := NewExecutor(newScriptedProvider(llm.ChatResponse{
+			Usage: usage, Content: "untrusted answer", FinishReason: llm.FinishStop,
+		}), registryWithTool(t, tool))
+		result, err := executor.Run(context.Background(), Request{Query: "question", Model: "tool-model"})
+		if !errors.Is(err, llm.ErrInvalidResponse) || result.Answer != "" || result.TokensUsed != 0 || tool.Invocations() != 0 {
+			t.Fatalf("Run() = %#v, %v, want no success facts and invalid response", result, err)
+		}
+	}
+}
 
 func TestExecutorStopsAtMaxSteps(t *testing.T) {
 	t.Parallel()
@@ -38,7 +55,7 @@ func TestExecutorRunsToolCallingLoopUntilFinalAnswer(t *testing.T) {
 		toolCallResponse("call-search", "search_docs", map[string]any{"query": "agent harness"}),
 		llm.ChatResponse{
 			Content:      "Agent harness uses native tool calling.",
-			Usage:        llm.Usage{TotalTokens: 3},
+			Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 1, OutputTokens: 2, TotalTokens: 3}),
 			FinishReason: llm.FinishStop,
 		},
 	)
@@ -119,7 +136,7 @@ func TestExecutorStopsWhenTokenBudgetExceeded(t *testing.T) {
 	tool := newLimitTool("search_docs")
 	registry := registryWithTool(t, tool)
 	provider := newScriptedProvider(llm.ChatResponse{
-		Usage:        llm.Usage{TotalTokens: 6},
+		Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 2, OutputTokens: 4, TotalTokens: 6}),
 		FinishReason: llm.FinishToolCall,
 		ToolCalls: []llm.ToolCall{
 			{ID: "call-budget", Name: "search_docs", Arguments: map[string]any{"query": "budget"}},
@@ -224,7 +241,7 @@ func repeatedToolCallResponse(toolName string, count int) []llm.ChatResponse {
 
 func toolCallResponse(id string, name string, args map[string]any) llm.ChatResponse {
 	return llm.ChatResponse{
-		Usage:        llm.Usage{TotalTokens: 1},
+		Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 1, TotalTokens: 1}),
 		FinishReason: llm.FinishToolCall,
 		ToolCalls: []llm.ToolCall{
 			{ID: id, Name: name, Arguments: args},

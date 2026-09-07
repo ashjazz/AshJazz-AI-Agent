@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs/testutil"
 )
@@ -56,6 +57,7 @@ func TestProviderWrapperRecordsOutcomeObservation(t *testing.T) {
 				provider.chatResponses["premium-model"] = llm.ChatResponse{
 					Content:      "served by fallback",
 					Model:        "fallback-model",
+					Usage:        llmtestutil.MustReportedUsage(llm.Usage{}),
 					FinishReason: llm.FinishStop,
 				}
 			},

@@ -3,8 +3,10 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,7 +14,13 @@ import (
 	logicchat "github.com/ashjazz/Longtermism/internal/logic/chat"
 	aieval "github.com/ashjazz/Longtermism/pkg/ai/eval"
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	"github.com/ashjazz/Longtermism/pkg/ai/llm/openai"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
+	"github.com/ashjazz/Longtermism/pkg/ai/ratelimit"
+	metricapi "go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestBuildChatRuntimeDoesNoProviderOrFilesystemWorkWhenDisabled(t *testing.T) {
@@ -105,6 +113,158 @@ func TestBuildChatRuntimeBuildsOneProviderAndOwnsOnlyEvidenceLifecycle(t *testin
 	}
 	if store.closeCalls != 1 {
 		t.Fatalf("evidence Close calls = %d, want 1", store.closeCalls)
+	}
+}
+
+func TestBuildChatRuntimeDoesNotCreateOrEmitAttemptMetricsWithoutAProviderAttempt(t *testing.T) {
+	tests := []struct {
+		name              string
+		enabled           bool
+		telemetryActive   bool
+		providerBuildFail bool
+		wantErr           bool
+		wantProviderCalls int
+		wantNoAdapter     bool
+	}{
+		{name: "chat disabled", telemetryActive: true, wantNoAdapter: true},
+		{name: "telemetry inactive", enabled: true, wantErr: true, wantNoAdapter: true},
+		{name: "provider build failure", enabled: true, telemetryActive: true, providerBuildFail: true, wantErr: true, wantProviderCalls: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bootstrap, reader, trackingMeter := newChatAttemptMetricsBootstrap(t, tt.telemetryActive)
+			config := t209ChatRuntimeConfig()
+			config.Enabled = tt.enabled
+			providerCalls := 0
+			openEvidenceCalls := 0
+
+			runtime, err := BuildChatRuntime(context.Background(), config, bootstrap, ChatRuntimeDependencies{
+				Provider: LLMProviderDependencies{
+					LookupEnv: lookupEnv(map[string]string{
+						"OPENAI_BASE_URL": "https://api.example.test/v1",
+						"OPENAI_API_KEY":  t069Secret,
+					}),
+					NewOpenAI: func(openai.Config) (llm.Provider, error) {
+						providerCalls++
+						if tt.providerBuildFail {
+							return nil, errors.New("private provider construction failure")
+						}
+						return &scriptedLLMProvider{name: "openai-compatible"}, nil
+					},
+				},
+				OpenEvidence: func(appeval.LocalEvidenceStoreConfig) (chatRuntimeEvidenceStore, error) {
+					openEvidenceCalls++
+					return &chatRuntimeEvidenceStoreStub{}, nil
+				},
+			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("BuildChatRuntime() error = %v, want_error=%t", err, tt.wantErr)
+			}
+			if runtime != nil {
+				t.Cleanup(func() {
+					if err := runtime.Close(); err != nil {
+						t.Errorf("close chat runtime: %v", err)
+					}
+				})
+			}
+			if providerCalls != tt.wantProviderCalls {
+				t.Fatalf("provider construction calls = %d, want %d", providerCalls, tt.wantProviderCalls)
+			}
+			if openEvidenceCalls != 0 {
+				t.Fatalf("evidence opens = %d, want 0 before a usable provider exists", openEvidenceCalls)
+			}
+			if got := trackingMeter.meterCalls.Load(); tt.wantNoAdapter && got != 0 {
+				t.Fatalf("attempt metrics adapter meter calls = %d, want 0", got)
+			}
+			if got := collectChatLLMRequestTotal(t, reader); got != 0 {
+				t.Fatalf("LLM request metric total = %d, want 0 without a provider attempt", got)
+			}
+		})
+	}
+}
+
+func TestBuildChatRuntimeCountsExactlyOneMetricPerRetryAttemptAcrossHTTPStack(t *testing.T) {
+	bootstrap, reader, trackingMeter := newChatAttemptMetricsBootstrap(t, true)
+	sharedLifecycle := bootstrap.Lifecycle
+	provider := &scriptedLLMProvider{
+		name: "openai-compatible",
+		response: &llm.ChatResponse{
+			Content:      "production metric composition is observable",
+			Model:        "model-t209",
+			FinishReason: llm.FinishStop,
+			Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 3, OutputTokens: 2, TotalTokens: 5}),
+		},
+		chatErrors: []error{
+			fmt.Errorf("first transient failure: %w", llm.ErrUpstream),
+			fmt.Errorf("second transient failure: %w", llm.ErrUpstream),
+		},
+	}
+
+	runtime, err := BuildChatRuntime(context.Background(), t209ChatRuntimeConfig(), bootstrap, ChatRuntimeDependencies{
+		Provider: LLMProviderDependencies{
+			LookupEnv: lookupEnv(map[string]string{
+				"OPENAI_BASE_URL": "https://api.example.test/v1",
+				"OPENAI_API_KEY":  t069Secret,
+			}),
+			NewOpenAI: func(openai.Config) (llm.Provider, error) { return provider, nil },
+		},
+		OpenEvidence: func(appeval.LocalEvidenceStoreConfig) (chatRuntimeEvidenceStore, error) {
+			return &chatRuntimeEvidenceStoreStub{}, nil
+		},
+		NewAITraceID: func() string { return "ai-t209" },
+		NewEvalRunID: func() string { return "eval-t209" },
+	})
+	if err != nil {
+		t.Fatalf("BuildChatRuntime() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := runtime.Close(); err != nil {
+			t.Errorf("close chat runtime: %v", err)
+		}
+	})
+	if bootstrap.Lifecycle != sharedLifecycle {
+		t.Fatal("chat runtime replaced the shared observability lifecycle")
+	}
+	if got := trackingMeter.meterCalls.Load(); got != 1 {
+		t.Fatalf("attempt metrics adapter meter calls = %d, want exactly 1 during composition", got)
+	}
+	baseline := collectChatLLMRequestTotal(t, reader)
+
+	completionCalls := 0
+	completionMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			completionCalls++
+			next.ServeHTTP(writer, request)
+		})
+	}
+	server := newChatRouteTestServer(t)
+	if err := RegisterChatRoutes(server, ChatRoutesInput{
+		Enabled:                     true,
+		Bootstrap:                   bootstrap,
+		CompletionLoggingMiddleware: completionMiddleware,
+		Handler:                     runtime.Handler,
+		Limiter:                     ratelimit.NewMemoryLimiter(ratelimit.MemoryLimiterConfig{}),
+		Limit:                       runtime.Limit,
+		state:                       &chatRoutesState{},
+	}); err != nil {
+		t.Fatalf("RegisterChatRoutes() error = %v", err)
+	}
+	response := serveChatRoute(server)
+	if response.Code != http.StatusOK {
+		t.Fatalf("chat response status/body = %d/%s, want 200", response.Code, response.Body.String())
+	}
+
+	after := collectChatLLMRequestTotal(t, reader)
+	metricDelta := after - baseline
+	if provider.chatCalls != 3 || metricDelta != int64(provider.chatCalls) {
+		t.Fatalf("provider attempts=%d LLM request counter delta=%d, want exact 1:1 mapping", provider.chatCalls, metricDelta)
+	}
+	if completionCalls != 1 {
+		t.Fatalf("HTTP completion middleware calls = %d, want 1", completionCalls)
+	}
+	if got := trackingMeter.meterCalls.Load(); got != 1 {
+		t.Fatalf("request handling created another attempt metrics adapter: meter calls = %d", got)
 	}
 }
 
@@ -294,6 +454,15 @@ func validChatRuntimeConfig() ChatRuntimeConfig {
 	}
 }
 
+func t209ChatRuntimeConfig() ChatRuntimeConfig {
+	config := validChatRuntimeConfig()
+	config.Provider = enabledLLMProviderInput("OPENAI_BASE_URL", "OPENAI_API_KEY", "model-t209")
+	config.Provider.Timeout = time.Second.String()
+	config.Provider.RetryMax = 2
+	config.Provider.RetryBackoff = time.Nanosecond
+	return config
+}
+
 func initializedChatTestBootstrap(t *testing.T) *ObservabilityBootstrap {
 	t.Helper()
 	lifecycle := NewObservabilityProviderLifecycle(ObservabilityProviderLifecycleConfig{})
@@ -304,6 +473,65 @@ func initializedChatTestBootstrap(t *testing.T) *ObservabilityBootstrap {
 		t.Fatal("test telemetry lifecycle did not initialize")
 	}
 	return &ObservabilityBootstrap{Lifecycle: lifecycle}
+}
+
+func newChatAttemptMetricsBootstrap(t *testing.T, active bool) (*ObservabilityBootstrap, *sdkmetric.ManualReader, *trackingChatMeterProvider) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	sdkProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := sdkProvider.Shutdown(context.Background()); err != nil {
+			t.Errorf("shutdown chat metric provider: %v", err)
+		}
+	})
+	trackingMeter := &trackingChatMeterProvider{MeterProvider: sdkProvider}
+	lifecycle := NewObservabilityProviderLifecycle(ObservabilityProviderLifecycleConfig{})
+	if active {
+		if err := lifecycle.Initialize(context.Background()); err != nil {
+			t.Fatalf("initialize chat metric lifecycle: %v", err)
+		}
+	}
+	// 测试不安装进程级 OTel provider，避免全局 singleton 污染其它用例；只把同一个
+	// MeterProvider 放入 bootstrap lifecycle，锁定 T219 必须复用这条现有生命周期。
+	lifecycle.meter = trackingMeter
+	return &ObservabilityBootstrap{
+		Runtime:   ObservabilityRuntimeConfig{Mode: ObservabilityRuntimeModeCollector, CollectorEnabled: true},
+		Lifecycle: lifecycle,
+	}, reader, trackingMeter
+}
+
+func collectChatLLMRequestTotal(t *testing.T, reader *sdkmetric.ManualReader) int64 {
+	t.Helper()
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &collected); err != nil {
+		t.Fatalf("collect chat metrics: %v", err)
+	}
+	var total int64
+	for _, scopeMetrics := range collected.ScopeMetrics {
+		for _, candidate := range scopeMetrics.Metrics {
+			if candidate.Name != "longtermism.llm.request.count" {
+				continue
+			}
+			sum, ok := candidate.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("LLM request metric aggregation = %T, want int64 sum", candidate.Data)
+			}
+			for _, point := range sum.DataPoints {
+				total += point.Value
+			}
+		}
+	}
+	return total
+}
+
+type trackingChatMeterProvider struct {
+	metricapi.MeterProvider
+	meterCalls atomic.Int64
+}
+
+func (provider *trackingChatMeterProvider) Meter(name string, options ...metricapi.MeterOption) metricapi.Meter {
+	provider.meterCalls.Add(1)
+	return provider.MeterProvider.Meter(name, options...)
 }
 
 type chatRuntimeEvidenceStoreStub struct {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs/testutil"
 )
@@ -21,7 +22,7 @@ func TestProviderWrapperExecutesRetryPolicyOncePerRequest(t *testing.T) {
 			fmt.Errorf("temporary one: %w", llm.ErrUpstream),
 			fmt.Errorf("temporary two: %w", llm.ErrUpstream),
 		},
-		chatResponse: &llm.ChatResponse{Content: "recovered", Model: "model"},
+		chatResponse: &llm.ChatResponse{Content: "recovered", Model: "model", Usage: llmtestutil.MustReportedUsage(llm.Usage{})},
 	}
 	var delays []time.Duration
 	wrapper := NewProviderWrapper(
@@ -50,7 +51,7 @@ func TestProviderWrapperSharesOneDeadlineAndDoesNotRetryCallerErrors(t *testing.
 				fmt.Errorf("temporary one: %w", llm.ErrUpstream),
 				fmt.Errorf("temporary two: %w", llm.ErrUpstream),
 			},
-			chatResponse: &llm.ChatResponse{Content: "recovered", Model: "model"},
+			chatResponse: &llm.ChatResponse{Content: "recovered", Model: "model", Usage: llmtestutil.MustReportedUsage(llm.Usage{})},
 		}
 		withTimeoutCalls := 0
 		wrapper := NewProviderWrapper(

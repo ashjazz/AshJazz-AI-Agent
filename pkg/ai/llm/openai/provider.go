@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -24,6 +25,15 @@ const providerName = "openai"
 const chatCompletionsPath = "/chat/completions"
 
 const defaultRequestTimeout = 60 * time.Second
+
+// maximumUsageTokens 是非流式响应单次 usage 的安全解析上限。
+//
+// 该上限主要防止兼容供应商返回异常大值后污染成本、指标或触发整数运算风险；
+// 它不是模型上下文窗口声明，也不用于猜测缺失 usage。
+const maximumUsageTokens = 100_000_000
+
+// 与 chat 的 1 MiB 内容边界一致；先限制 wire body 再解码，未知字段也受保护。
+const maximumChatResponseBytes = 1 << 20
 
 // Config 是 OpenAI-compatible provider 的稳定装配配置。
 //
@@ -350,9 +360,9 @@ type openAIJSONSchema struct {
 }
 
 type openAIChatResponse struct {
-	Model   string         `json:"model"`
-	Choices []openAIChoice `json:"choices"`
-	Usage   openAIUsage    `json:"usage"`
+	Model   string                   `json:"model"`
+	Choices []openAIChoice           `json:"choices"`
+	Usage   *openAINonStreamingUsage `json:"usage"`
 }
 
 type openAIChoice struct {
@@ -376,6 +386,14 @@ type openAIToolFunction struct {
 	Arguments string `json:"arguments"`
 }
 
+type openAINonStreamingUsage struct {
+	PromptTokens     *int64 `json:"prompt_tokens"`
+	CompletionTokens *int64 `json:"completion_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+}
+
+// openAIUsage 保留流式协议的既有末尾 chunk 映射；非流式响应使用上面的
+// presence-aware DTO，避免 T215 的严格成功契约无意改变 SSE 行为。
 type openAIUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -387,18 +405,36 @@ func parseChatResponse(resp *http.Response) (*llm.ChatResponse, error) {
 		return nil, err
 	}
 
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maximumChatResponseBytes+1))
+	if err != nil {
+		// 读 body 时仍可能发生取消、超时或断流。保留稳定传输语义，但不包装
+		// 任意 reader 的原始错误，以免兼容网关把正文/凭据混进错误文本。
+		if errors.Is(err, context.Canceled) {
+			return nil, context.Canceled
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, errors.Join(llm.ErrUpstream, context.DeadlineExceeded)
+		}
+		return nil, llm.ErrUpstream
+	}
+	if len(body) > maximumChatResponseBytes {
+		return nil, invalidOpenAIResponseError{}
+	}
 	var decoded openAIChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return nil, fmt.Errorf("decode openai chat response: %w", err)
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		// 2xx body 也是不可信外部输入。decoder 的原始错误可能携带 provider
+		// 字段和值，因此只向 adapter 外返回稳定、低敏的协议分类。
+		return nil, invalidOpenAIResponseError{}
+	}
+
+	providerUsage, err := mapNonStreamingUsage(decoded.Usage)
+	if err != nil {
+		return nil, err
 	}
 
 	result := &llm.ChatResponse{
 		Model: decoded.Model,
-		Usage: llm.Usage{
-			InputTokens:  decoded.Usage.PromptTokens,
-			OutputTokens: decoded.Usage.CompletionTokens,
-			TotalTokens:  decoded.Usage.TotalTokens,
-		},
+		Usage: providerUsage,
 	}
 	if len(decoded.Choices) == 0 {
 		return result, nil
@@ -415,6 +451,49 @@ func parseChatResponse(resp *http.Response) (*llm.ChatResponse, error) {
 	result.ToolCalls = toolCalls
 	return result, nil
 }
+
+// mapNonStreamingUsage 在 adapter 边界把 JSON presence 转成领域事实。
+//
+// 顶层 missing/null 和子字段 missing 都会解析为 nil，因此能与显式的数值 0
+// 区分。任何失败只返回稳定类别，不携带 upstream body、model、endpoint 或凭据。
+func mapNonStreamingUsage(input *openAINonStreamingUsage) (llm.ProviderUsage, error) {
+	if input == nil || input.PromptTokens == nil || input.CompletionTokens == nil || input.TotalTokens == nil {
+		return llm.NewUnavailableProviderUsage(), invalidOpenAIResponseError{}
+	}
+
+	promptTokens := *input.PromptTokens
+	completionTokens := *input.CompletionTokens
+	totalTokens := *input.TotalTokens
+	if promptTokens < 0 || completionTokens < 0 || totalTokens < 0 {
+		return llm.NewUnavailableProviderUsage(), invalidOpenAIResponseError{}
+	}
+	if promptTokens > maximumUsageTokens || completionTokens > maximumUsageTokens || totalTokens > maximumUsageTokens {
+		return llm.NewUnavailableProviderUsage(), invalidOpenAIResponseError{}
+	}
+	if totalTokens != promptTokens+completionTokens {
+		return llm.NewUnavailableProviderUsage(), invalidOpenAIResponseError{}
+	}
+
+	usage, err := llm.NewReportedProviderUsage(llm.Usage{
+		InputTokens:  int(promptTokens),
+		OutputTokens: int(completionTokens),
+		TotalTokens:  int(totalTokens),
+	})
+	if err != nil {
+		return llm.ProviderUsage{}, invalidOpenAIResponseError{}
+	}
+	return usage, nil
+}
+
+// invalidOpenAIResponseError 只暴露稳定分类。原始上游正文停留在 adapter 的
+// bounded decode 过程内，不能经错误链进入日志、HTTP response 或 smoke report。
+type invalidOpenAIResponseError struct{}
+
+func (invalidOpenAIResponseError) Error() string { return llm.ErrInvalidResponse.Error() }
+
+func (invalidOpenAIResponseError) Class() string { return "invalid_response" }
+
+func (invalidOpenAIResponseError) Is(target error) bool { return target == llm.ErrInvalidResponse }
 
 func mapFinishReason(reason string) llm.FinishReason {
 	switch reason {
@@ -440,7 +519,7 @@ func mapToolCalls(calls []openAIToolCall) ([]llm.ToolCall, error) {
 	for _, call := range calls {
 		arguments, err := decodeToolArguments(call.Function.Arguments)
 		if err != nil {
-			return nil, fmt.Errorf("decode openai tool call %q arguments: %w", call.ID, err)
+			return nil, invalidOpenAIResponseError{}
 		}
 		mapped = append(mapped, llm.ToolCall{
 			ID:        call.ID,

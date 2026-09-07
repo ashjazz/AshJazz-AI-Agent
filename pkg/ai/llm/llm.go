@@ -61,6 +61,68 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// UsageAvailability 标识 token 用量是否是 provider 明确报告的事实。
+//
+// 这里不能让 Usage 的数值零值同时表示“provider 报告了全零”和“provider 没有
+// 返回 usage”：两者会分别影响计费、指标和评估证据，混淆后会制造错误的生产事实。
+type UsageAvailability string
+
+const (
+	UsageUnavailable UsageAvailability = "unavailable"
+	UsageReported    UsageAvailability = "reported"
+)
+
+// ProviderUsage 把 usage availability 与可选摘要绑定为一个领域值对象。
+//
+// availability 保持私有，调用方必须通过构造函数显式声明事实来源；唯一的
+// *Usage 只承载可选 summary。零值有意不代表 reported：fake 或未来 adapter 若
+// 遗漏构造，会被上层 fail-closed 校验识别，而不会悄悄变成真实零 token。
+type ProviderUsage struct {
+	availability UsageAvailability
+	summary      *Usage
+}
+
+// NewUnavailableProviderUsage 创建“provider 未报告 usage”的显式事实。
+func NewUnavailableProviderUsage() ProviderUsage {
+	return ProviderUsage{availability: UsageUnavailable}
+}
+
+// NewReportedProviderUsage 创建“provider 明确报告 usage”的事实。
+//
+// adapter 先校验协议 presence，本值对象再守护供应商无关的数值不变量。
+// 无效报告必须返回错误，不能冒充“未报告”。reasoning/cache 是细分统计，不能
+// 再加到 input+output 上重复计费；复制私有 summary 防止调用方改写既有证据。
+func NewReportedProviderUsage(summary Usage) (ProviderUsage, error) {
+	const maxTokens = 100_000_000
+	for _, count := range []int{summary.InputTokens, summary.OutputTokens, summary.TotalTokens,
+		summary.ReasoningTokens, summary.CacheReadTokens, summary.CacheWriteTokens} {
+		if count < 0 || count > maxTokens {
+			return ProviderUsage{}, ErrInvalidResponse
+		}
+	}
+	if summary.TotalTokens != summary.InputTokens+summary.OutputTokens {
+		return ProviderUsage{}, ErrInvalidResponse
+	}
+	cloned := summary
+	return ProviderUsage{
+		availability: UsageReported,
+		summary:      &cloned,
+	}, nil
+}
+
+// Availability 返回 provider 对 usage 的明确报告状态。
+func (usage ProviderUsage) Availability() UsageAvailability {
+	return usage.availability
+}
+
+// Summary 返回防御性拷贝；只有 availability=reported 且摘要存在时 ok 才为 true。
+func (usage ProviderUsage) Summary() (summary Usage, ok bool) {
+	if usage.availability != UsageReported || usage.summary == nil {
+		return Usage{}, false
+	}
+	return *usage.summary, true
+}
+
 // Tool 是暴露给模型的可调用工具声明。Parameters 应为 JSON Schema object。
 type Tool struct {
 	Name        string         `json:"name"`
@@ -114,15 +176,21 @@ const (
 
 // ChatResponse 是一次（非流式）聊天补全的响应。
 type ChatResponse struct {
-	Content      string       `json:"content"`
-	Model        string       `json:"model"` // 实际服务的模型名，可能与请求不同（降级时）
-	Usage        Usage        `json:"usage"`
-	FinishReason FinishReason `json:"finish_reason"`
-	ToolCalls    []ToolCall   `json:"tool_calls,omitempty"`
+	Content      string        `json:"content"`
+	Model        string        `json:"model"` // 实际服务的模型名，可能与请求不同（降级时）
+	Usage        ProviderUsage `json:"usage"`
+	FinishReason FinishReason  `json:"finish_reason"`
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`
 }
 
 // ErrUpstream 表示上游 provider 不可用。resilience/ 据此决定重试/熔断/降级。
 var ErrUpstream = errors.New("llm: upstream provider unavailable")
+
+// ErrInvalidResponse 表示 provider 返回了无法形成可信领域事实的成功响应。
+//
+// 该 sentinel 与 ErrUpstream 分离：协议事实缺失不能被当作网络可用性问题无限重试，
+// 上层仍可用 errors.Is 做稳定、低敏的 invalid-response 分类。
+var ErrInvalidResponse = errors.New("llm: invalid provider response")
 
 // ErrRateLimit 表示 provider 或上游网关返回限流。
 //

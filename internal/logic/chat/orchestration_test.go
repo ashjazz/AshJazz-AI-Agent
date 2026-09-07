@@ -10,6 +10,7 @@ import (
 	appobs "github.com/ashjazz/Longtermism/internal/observability"
 	aieval "github.com/ashjazz/Longtermism/pkg/ai/eval"
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
 )
 
@@ -45,7 +46,7 @@ func TestChatUsecaseOrchestratesEvidencePipelineInOrderWithoutMutatingFacts(t *t
 		Content:      "evidence pipeline completed",
 		Model:        "provider-actual-model",
 		FinishReason: llm.FinishStop,
-		Usage:        llm.Usage{InputTokens: 4, OutputTokens: 3, TotalTokens: 7},
+		Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 4, OutputTokens: 3, TotalTokens: 7}),
 	}
 	responseBefore := *response
 	generationObserver := &recordingGenerationObserver{
@@ -121,7 +122,11 @@ func TestChatUsecaseOrchestratesEvidencePipelineInOrderWithoutMutatingFacts(t *t
 	if !reflect.DeepEqual(events, wantEvents) {
 		t.Fatalf("orchestration events = %#v, want %#v", events, wantEvents)
 	}
-	if result.Content != response.Content || result.Model != response.Model || result.Usage != response.Usage {
+	responseUsage, reported := response.Usage.Summary()
+	if !reported {
+		t.Fatal("provider fixture must carry explicitly reported usage")
+	}
+	if result.Content != response.Content || result.Model != response.Model || result.Usage != responseUsage {
 		t.Fatalf("business result = %#v, want provider facts", result)
 	}
 	if result.Identity.EvalRunID != "" ||
@@ -318,7 +323,7 @@ func TestChatUsecaseKeepsProviderResultWhenEvidenceSideChannelsFail(t *testing.T
 						Content:      "business result survives side-channel failures",
 						Model:        "provider-actual-model",
 						FinishReason: llm.FinishStop,
-						Usage:        llm.Usage{InputTokens: 2, OutputTokens: 4, TotalTokens: 6},
+						Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 2, OutputTokens: 4, TotalTokens: 6}),
 					}, nil
 				}},
 				RequestedModel:          "server-configured-model",
@@ -373,6 +378,7 @@ func TestChatUsecaseDiagnosesMissingRequiredEvaluationPorts(t *testing.T) {
 				return &llm.ChatResponse{
 					Content:      "missing ports remain diagnosable",
 					Model:        "provider-actual-model",
+					Usage:        llmtestutil.MustReportedUsage(llm.Usage{}),
 					FinishReason: llm.FinishStop,
 				}, nil
 			}},

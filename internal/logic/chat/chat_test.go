@@ -16,6 +16,7 @@ import (
 
 	appobs "github.com/ashjazz/Longtermism/internal/observability"
 	"github.com/ashjazz/Longtermism/pkg/ai/llm"
+	llmtestutil "github.com/ashjazz/Longtermism/pkg/ai/llm/testutil"
 	"github.com/ashjazz/Longtermism/pkg/ai/obs"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	traceapi "go.opentelemetry.io/otel/trace"
@@ -47,14 +48,14 @@ func TestChatUsecaseReturnsProviderFactsAndCreatesAIIdentityBeforeProviderCall(t
 				Content:      "Observe facts, evaluate evidence, then regress changes.",
 				Model:        "provider-actual-model",
 				FinishReason: llm.FinishLength,
-				Usage: llm.Usage{
+				Usage: llmtestutil.MustReportedUsage(llm.Usage{
 					InputTokens:      11,
 					OutputTokens:     17,
 					ReasoningTokens:  5,
 					CacheReadTokens:  3,
 					CacheWriteTokens: 2,
-					TotalTokens:      38,
-				},
+					TotalTokens:      28,
+				}),
 			}, nil
 		},
 	}
@@ -84,7 +85,7 @@ func TestChatUsecaseReturnsProviderFactsAndCreatesAIIdentityBeforeProviderCall(t
 	if result.FinishReason != llm.FinishLength {
 		t.Fatalf("result finish reason = %q, want %q", result.FinishReason, llm.FinishLength)
 	}
-	wantUsage := llm.Usage{InputTokens: 11, OutputTokens: 17, ReasoningTokens: 5, CacheReadTokens: 3, CacheWriteTokens: 2, TotalTokens: 38}
+	wantUsage := llm.Usage{InputTokens: 11, OutputTokens: 17, ReasoningTokens: 5, CacheReadTokens: 3, CacheWriteTokens: 2, TotalTokens: 28}
 	if result.Usage != wantUsage {
 		t.Fatalf("result usage = %#v, want %#v", result.Usage, wantUsage)
 	}
@@ -112,7 +113,7 @@ func TestChatUsecaseHandsTrustedSmokeIdentityToTelemetryAndManifest(t *testing.T
 		if got := SmokeRunIDFromContext(ctx); got != marker {
 			t.Fatalf("provider smoke marker = %q, want %q", got, marker)
 		}
-		return &llm.ChatResponse{Content: "ok", Model: "provider-model", FinishReason: llm.FinishStop}, nil
+		return &llm.ChatResponse{Content: "ok", Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 	}}
 	usecase := NewChatUsecase(ChatUsecaseDependencies{
 		Provider:                provider,
@@ -171,7 +172,7 @@ func TestChatUsecaseRecordsAIPlaneFactOnlyForTrustedSmokeExecution(t *testing.T)
 		defer root.End()
 		usecase := NewChatUsecase(ChatUsecaseDependencies{
 			Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-				return &llm.ChatResponse{Model: "provider-model", FinishReason: llm.FinishStop}, nil
+				return &llm.ChatResponse{Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 			}},
 			RequestedModel:          "server-model",
 			NewAITraceID:            func() string { return "ai-t200-recording" },
@@ -194,7 +195,7 @@ func TestChatUsecaseRecordsAIPlaneFactOnlyForTrustedSmokeExecution(t *testing.T)
 		recorder := &recordingAIPlaneFactRecorder{}
 		usecase := NewChatUsecase(ChatUsecaseDependencies{
 			Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-				return &llm.ChatResponse{Model: "provider-model", FinishReason: llm.FinishStop}, nil
+				return &llm.ChatResponse{Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 			}},
 			RequestedModel:          "server-model",
 			NewAITraceID:            func() string { return "ai-t200-ordinary" },
@@ -214,7 +215,7 @@ func TestChatUsecaseRecordsAIPlaneFactOnlyForTrustedSmokeExecution(t *testing.T)
 		recorder := &recordingAIPlaneFactRecorder{}
 		usecase := NewChatUsecase(ChatUsecaseDependencies{
 			Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-				return &llm.ChatResponse{Model: "provider-model", FinishReason: llm.FinishStop}, nil
+				return &llm.ChatResponse{Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 			}},
 			RequestedModel:          "server-model",
 			NewAITraceID:            func() string { return "ai-t200-untrusted" },
@@ -234,7 +235,7 @@ func TestChatUsecaseRecordsAIPlaneFactOnlyForTrustedSmokeExecution(t *testing.T)
 	t.Run("missing recorder keeps the business result unchanged", func(t *testing.T) {
 		usecase := NewChatUsecase(ChatUsecaseDependencies{
 			Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-				return &llm.ChatResponse{Model: "provider-model", FinishReason: llm.FinishStop}, nil
+				return &llm.ChatResponse{Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 			}},
 			RequestedModel:          "server-model",
 			NewAITraceID:            func() string { return "ai-t200-no-recorder" },
@@ -264,7 +265,7 @@ func TestOrdinaryChatDoesNotWriteSmokeRunManifest(t *testing.T) {
 	writer := &recordingChatRunManifestWriter{}
 	usecase := NewChatUsecase(ChatUsecaseDependencies{
 		Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-			return &llm.ChatResponse{Model: "provider-model", FinishReason: llm.FinishStop}, nil
+			return &llm.ChatResponse{Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 		}},
 		RequestedModel:          "server-model",
 		NewAITraceID:            func() string { return "ai-t177-ordinary" },
@@ -293,7 +294,7 @@ func TestChatSmokeManifestRejectsBridgeIdentityWithoutActiveSpanContext(t *testi
 	writer := &recordingChatRunManifestWriter{}
 	usecase := NewChatUsecase(ChatUsecaseDependencies{
 		Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-			return &llm.ChatResponse{Model: "provider-model", FinishReason: llm.FinishStop}, nil
+			return &llm.ChatResponse{Model: "provider-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 		}},
 		RequestedModel:          "server-model",
 		NewAITraceID:            func() string { return "ai-t177-no-native-span" },
@@ -387,7 +388,7 @@ func TestChatUsecaseRecordsOnlyLowSensitivityTelemetryFacts(t *testing.T) {
 	telemetry := &recordingTelemetry{}
 	usecase := NewChatUsecase(ChatUsecaseDependencies{
 		Provider: &scriptedProvider{chat: func(context.Context, *llm.ChatRequest) (*llm.ChatResponse, error) {
-			return &llm.ChatResponse{Content: outputMarker, Model: "provider-actual-model", FinishReason: llm.FinishStop, Usage: llm.Usage{InputTokens: 13, OutputTokens: 7, TotalTokens: 20}}, nil
+			return &llm.ChatResponse{Content: outputMarker, Model: "provider-actual-model", FinishReason: llm.FinishStop, Usage: llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 13, OutputTokens: 7, TotalTokens: 20})}, nil
 		}},
 		RequestedModel:          "server-configured-model",
 		NewAITraceID:            func() string { return "ai-t070-private" },
@@ -425,7 +426,7 @@ func TestChatUsecaseGeneratesFreshAIIdentityForEachExecution(t *testing.T) {
 			t.Fatal("provider context must contain a generated identity")
 		}
 		providerAITraceIDs = append(providerAITraceIDs, identity.AITraceID)
-		return &llm.ChatResponse{Model: "provider-actual-model", FinishReason: llm.FinishStop}, nil
+		return &llm.ChatResponse{Model: "provider-actual-model", Usage: llmtestutil.MustReportedUsage(llm.Usage{}), FinishReason: llm.FinishStop}, nil
 	}}
 	ids := []string{"ai-t070-first", "ai-t070-second"}
 	usecase := NewChatUsecase(ChatUsecaseDependencies{
@@ -500,7 +501,7 @@ func TestChatUsecaseKeepsBusinessResultWhenTelemetryFails(t *testing.T) {
 				Content:      "business result survives telemetry failure",
 				Model:        "provider-actual-model",
 				FinishReason: llm.FinishStop,
-				Usage:        llm.Usage{InputTokens: 2, OutputTokens: 5, TotalTokens: 7},
+				Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 2, OutputTokens: 5, TotalTokens: 7}),
 			}, nil
 		},
 	}
@@ -688,7 +689,16 @@ func TestChatUsecaseRejectsUnsafeProviderResponseFacts(t *testing.T) {
 		Content:      "safe response",
 		Model:        "provider-model-v1",
 		FinishReason: llm.FinishStop,
-		Usage:        llm.Usage{InputTokens: 2, OutputTokens: 3, TotalTokens: 5},
+		Usage:        llmtestutil.MustReportedUsage(llm.Usage{InputTokens: 2, OutputTokens: 3, TotalTokens: 5}),
+	}
+	cloneValid := func() llm.ChatResponse {
+		response := valid
+		summary, reported := valid.Usage.Summary()
+		if !reported {
+			t.Fatal("valid fixture must carry explicitly reported usage")
+		}
+		response.Usage = llmtestutil.MustReportedUsage(summary)
+		return response
 	}
 	tests := []struct {
 		name     string
@@ -697,7 +707,7 @@ func TestChatUsecaseRejectsUnsafeProviderResponseFacts(t *testing.T) {
 		{
 			name: "credential-shaped model outside canonical allowlist",
 			response: func() llm.ChatResponse {
-				response := valid
+				response := cloneValid()
 				response.Model = "sk-proj-forbidden-model-t090"
 				return response
 			}(),
@@ -705,7 +715,7 @@ func TestChatUsecaseRejectsUnsafeProviderResponseFacts(t *testing.T) {
 		{
 			name: "overlong model",
 			response: func() llm.ChatResponse {
-				response := valid
+				response := cloneValid()
 				response.Model = strings.Repeat("m", maxModelIdentifierBytes+1)
 				return response
 			}(),
@@ -713,7 +723,7 @@ func TestChatUsecaseRejectsUnsafeProviderResponseFacts(t *testing.T) {
 		{
 			name: "tool call cannot be silently dropped by non-tool chat",
 			response: func() llm.ChatResponse {
-				response := valid
+				response := cloneValid()
 				response.FinishReason = llm.FinishToolCall
 				response.ToolCalls = []llm.ToolCall{{ID: "call-t090", Name: "unsafe-unconfigured-tool"}}
 				return response
@@ -722,31 +732,47 @@ func TestChatUsecaseRejectsUnsafeProviderResponseFacts(t *testing.T) {
 		{
 			name: "unknown finish reason is outside the public contract",
 			response: func() llm.ChatResponse {
-				response := valid
+				response := cloneValid()
 				response.FinishReason = "safety_blocked"
+				return response
+			}(),
+		},
+		{
+			name: "unavailable usage",
+			response: func() llm.ChatResponse {
+				response := cloneValid()
+				response.Usage = llm.NewUnavailableProviderUsage()
 				return response
 			}(),
 		},
 		{
 			name: "negative usage",
 			response: func() llm.ChatResponse {
-				response := valid
-				response.Usage.OutputTokens = -1
+				response := cloneValid()
+				invalid, err := llm.NewReportedProviderUsage(llm.Usage{OutputTokens: -1})
+				if !errors.Is(err, llm.ErrInvalidResponse) {
+					t.Fatal("constructor must reject negative usage")
+				}
+				response.Usage = invalid
 				return response
 			}(),
 		},
 		{
 			name: "inconsistent total usage",
 			response: func() llm.ChatResponse {
-				response := valid
-				response.Usage.TotalTokens = 4
+				response := cloneValid()
+				invalid, err := llm.NewReportedProviderUsage(llm.Usage{InputTokens: 2, OutputTokens: 3, TotalTokens: 4})
+				if !errors.Is(err, llm.ErrInvalidResponse) {
+					t.Fatal("constructor must reject inconsistent usage")
+				}
+				response.Usage = invalid
 				return response
 			}(),
 		},
 		{
 			name: "oversized content",
 			response: func() llm.ChatResponse {
-				response := valid
+				response := cloneValid()
 				response.Content = strings.Repeat("x", maxChatResponseBytes+1)
 				return response
 			}(),
